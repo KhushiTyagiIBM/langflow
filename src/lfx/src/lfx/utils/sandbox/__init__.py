@@ -35,6 +35,7 @@ import contextlib
 import os
 
 from lfx.log.logger import logger
+from lfx.observability import get_execution_protocol
 from lfx.utils.sandbox.base import (
     SESSION_MODE_FLOW,
     Capabilities,
@@ -89,6 +90,7 @@ __all__ = [
     "run_code_in_sandbox",
     "sanitize_code",
     "session_for",
+    "session_for_component",
     "shutdown_sandbox",
 ]
 
@@ -183,6 +185,23 @@ def session_for(flow_id: str | None, user_id: str | None) -> SessionKey | None:
     if not flow_id or not user_id:
         return None
     return SessionKey(flow_id=str(flow_id), user_id=str(user_id))
+
+
+def session_for_component(component: object) -> SessionKey | None:
+    """Build a session key without confusing a service account for an end user.
+
+    Editor and local CLI runs are owned directly by ``component.user_id``.
+    Served runs execute as a service account, so reuse must instead be scoped
+    to ``graph.end_user_id``. An unidentified served caller gets no session.
+    Unknown future serving protocols take the safer served path by default.
+    """
+    protocol = get_execution_protocol()
+    if protocol in {None, "lfx.run", "v1.build"}:
+        user_id = getattr(component, "user_id", None)
+    else:
+        graph = getattr(component, "graph", None)
+        user_id = getattr(graph, "end_user_id", None)
+    return session_for(getattr(component, "flow_id", None), user_id)
 
 
 def _effective_session(backend: SandboxBackend, session: SessionKey | None) -> SessionKey | None:

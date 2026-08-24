@@ -237,9 +237,10 @@ class SecuritySettings(BaseModel):
 
     Default False, because the refusal is the honest answer: an operator who
     turned the network off did not ask for "off except one range". The
-    exception is not cosmetic. Under ``createos`` it is 169.254.0.0/16, which
-    carries the VM metadata service and answered a guest request under a live
-    deny-all policy.
+    exception is not cosmetic. Under ``createos`` it includes 169.254.0.0/16,
+    which carries the VM metadata service and answered a guest request under a
+    live deny-all policy. A configured domain allowlist also opens
+    1.1.1.1:53, whose resolver accepts arbitrary DNS query names.
 
     Set this to true only after reading what the chosen backend cannot block
     and deciding those destinations are acceptable in your deployment. Only
@@ -305,6 +306,15 @@ class SecuritySettings(BaseModel):
     in the UI rather than written to storage. Raise this only when the
     deployment can carry payloads of that size. Only used when
     ``sandbox_collect_artifacts`` is True."""
+
+    sandbox_max_output_bytes: int = Field(default=1024 * 1024, ge=1, le=64 * 1024 * 1024)
+    """Combined stdout and stderr retained from one sandbox run, in bytes.
+
+    Guest output is untrusted and streams into the Langflow worker, so this
+    bounds host memory before the result is joined into strings. A run that
+    exceeds the limit is stopped as an infrastructure error rather than
+    returning a silently truncated result. Only used when sandbox_backend is
+    not "none"."""
 
     restrict_local_file_access: bool = False
     """If set to True, the built-in file-reading components (File, Directory, JSON/CSV-to-Data)

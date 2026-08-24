@@ -102,7 +102,8 @@ Because of this, Langflow refuses to run `createos` under a restricted egress
 policy by default. To use `createos` with `LANGFLOW_SANDBOX_ALLOW_NETWORK=false`
 or with a domain allowlist, set
 `LANGFLOW_SANDBOX_ACCEPT_EGRESS_EXCEPTIONS=true`. That variable records that you
-read this warning and accept the reachable range.
+read this warning and accept the reachable range. With a domain allowlist, it
+also accepts the unrestricted DNS-query path described below.
 :::
 
 :::warning
@@ -218,25 +219,17 @@ legitimate work is being cut off.
 
 ### Sessions across workers
 
-Langflow runs more than one worker, and each has its own memory. The session
-guest is therefore registered with CreateOS rather than only in the worker that
-made it: it is created under a name derived from the session token, and because
-a sandbox name is unique per account among non-terminal sandboxes, the first
-worker to create it wins and every other worker adopts that same guest.
+Session guests are process-owned. CreateOS does not expose a distributed lock
+or lease, while execution, idle reaping, and shutdown are coordinated by
+process-local locks. Each worker therefore includes a random worker identity in
+the guest name and never adopts another worker's guest.
 
-So one flow has one guest per user, whichever worker takes the request, and you
-are billed for one. This works across replicas as long as they share a CreateOS
-API key.
-
-:::warning Overlapping executions are not serialized across workers
-Executions of one session are serialized within a worker. Two that overlap on
-different workers are not: they share one guest, so they see each other's
-variables and files partway through.
-
-Each execution uploads its program under its own name and the state file is
-replaced atomically, so neither can corrupt the other. The result is still
-last-writer-wins on any variable both touch. Enable `flow` sessions only where
-executions of one flow either do not overlap or tolerate sharing.
+:::warning Use sticky routing for session continuity
+Two requests for one flow and end user can reach different workers and receive
+different session state. If a deployment relies on `flow` sessions, configure
+sticky routing so that identity stays on one worker. Without sticky routing,
+the isolation boundary remains safe, but state continuity is not guaranteed
+and multiple workers can each hold a billed guest for the same logical session.
 :::
 
 The guest is **not** paused between executions. Measured on the live control
@@ -283,10 +276,9 @@ server heartbeats every 5 seconds, notices the client is gone, and kills the
 guest command. A timed-out execution reports the same result as it would under
 `exec-sandbox`, and it keeps whatever the program had already printed.
 
-A margin is added for network transport, scaled to the configured value, so a
-short timeout is not multiplied into a long wait. Treat the setting as a close
-bound rather than an exact one: the margin, the upload, and VM teardown are not
-inside it.
+The guest stream is closed at exactly the configured execution deadline. A
+separate, longer HTTP budget covers network transport without widening the
+guest's runtime. Upload and VM teardown are not inside the execution deadline.
 
 ## What this backend does and does not give you
 

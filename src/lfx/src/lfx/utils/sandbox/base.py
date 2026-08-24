@@ -114,6 +114,7 @@ class _SandboxSettings:
     session_idle_seconds: int = 600
     collect_artifacts: bool = False
     max_artifact_bytes: int = 5 * 1024 * 1024
+    max_output_bytes: int = 1024 * 1024
 
 
 def _sandbox_settings() -> _SandboxSettings:
@@ -143,6 +144,7 @@ def _sandbox_settings() -> _SandboxSettings:
         session_idle_seconds=getattr(settings, "sandbox_session_idle_seconds", defaults.session_idle_seconds),
         collect_artifacts=getattr(settings, "sandbox_collect_artifacts", defaults.collect_artifacts),
         max_artifact_bytes=getattr(settings, "sandbox_max_artifact_bytes", defaults.max_artifact_bytes),
+        max_output_bytes=getattr(settings, "sandbox_max_output_bytes", defaults.max_output_bytes),
     )
 
 

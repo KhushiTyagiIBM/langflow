@@ -49,6 +49,7 @@ def _settings(backend, **extra):
         "sandbox_session_idle_seconds": 600,
         "sandbox_collect_artifacts": False,
         "sandbox_max_artifact_bytes": 5 * 1024 * 1024,
+        "sandbox_max_output_bytes": 1024 * 1024,
     }
     defaults.update(extra)
     return SimpleNamespace(settings=SimpleNamespace(**defaults))
@@ -618,11 +619,10 @@ class TestCreateosPolicyVerification:
 
     @pytest.mark.parametrize(
         ("timeout_seconds", "expected"),
-        [(1, 3), (5, 10), (30, 45), (300, 315)],
+        [(1, 1), (5, 5), (30, 30), (300, 300)],
     )
-    def test_exec_deadline_scales_with_the_configured_timeout(self, timeout_seconds, expected):
-        """Verify that the exec deadline scales with the configured sandbox timeout."""
-        # A 1s timeout must not silently become a 16s wait.
+    def test_exec_deadline_is_the_configured_timeout(self, timeout_seconds, expected):
+        """Transport grace must not widen the guest wall-clock limit."""
         assert createos_module._exec_deadline(timeout_seconds) == expected
 
 
@@ -792,6 +792,29 @@ class TestCreateosStreamingExec:
         assert result.exit_code == base_module._EXIT_CODE_TIMEOUT
         assert "timed out" in result.error_message()
 
+    def test_combined_output_is_bounded(self, monkeypatch, createos):
+        """A guest cannot grow unbounded stdout and stderr lists in the worker."""
+        api = createos(_FakeCreateosApi(exec_stream_lines=[{"stdout": "1234"}, {"stderr": "56"}, {"exit_code": 0}]))
+        _use_createos(monkeypatch, sandbox_max_output_bytes=5)
+
+        with pytest.raises(SandboxExecutionError, match="SANDBOX_MAX_OUTPUT_BYTES"):
+            run_code_in_sandbox("print('too much')")
+
+        assert "sb-test" in api.deleted_ids
+
+    def test_timeout_skips_artifacts_and_metrics(self, monkeypatch, createos):
+        """Teardown must start without more guest work after the deadline."""
+        api = createos(_FakeCreateosApi(exec_stream_lines=[{"stdout": "tick"}] * 50, artifact_archive=b"ignored"))
+        _use_createos(monkeypatch, sandbox_collect_artifacts=True, sandbox_timeout_seconds=1)
+        monkeypatch.setenv("CREATEOS_SANDBOX_METRICS", "true")
+        monkeypatch.setattr(createos_module, "_exec_deadline", lambda _timeout: -1.0)
+
+        result = run_code_in_sandbox("while True: pass")
+
+        assert result.exit_code == base_module._EXIT_CODE_TIMEOUT
+        assert len(api.exec_commands) == 1
+        assert not any(path.endswith("/metrics") for _, path in api.calls)
+
 
 # ---------------------------------------------------------------------------
 # Sessions
@@ -803,8 +826,8 @@ def _session(flow="flow-1", user="user-1"):
     return SessionKey(flow_id=flow, user_id=user)
 
 
-def _session_identity_for(session=None, egress=None, memory_mb=192):
-    """The cache/name key production derives, policy included.
+def _session_identity_for(session=None, egress=None, memory_mb=192, executor=None, rootfs=None):
+    """The cache/name key production derives, policy, image, and worker included.
 
     Mirrors _run_in_session: the identity binds the session to the egress and
     memory the guest was built under, so a test cannot assert a name that
@@ -812,12 +835,9 @@ def _session_identity_for(session=None, egress=None, memory_mb=192):
     """
     session = session or _session()
     egress = createos_module._CREATEOS_DENY_ALL_EGRESS if egress is None else egress
-    return createos_module._session_identity(session.token(), egress, memory_mb)
-
-
-def _session_name_for(**kwargs):
-    """Return the guest name production would derive for the given session identity."""
-    return createos_module._session_guest_name(_session_identity_for(**kwargs))
+    executor = executor or registry_module._instances["createos"]
+    rootfs = rootfs or createos_module._CREATEOS_DEFAULT_ROOTFS
+    return createos_module._session_identity(session.token(), egress, memory_mb, rootfs, executor._worker_id)
 
 
 class TestCreateosSessions:
@@ -909,14 +929,8 @@ class TestCreateosSessions:
 
         assert api.deleted_ids == ["sb-one"]
 
-    def test_a_fork_child_adopts_the_guest_instead_of_building_a_second_one(self, monkeypatch, createos):
-        """The in-process map is a cache; the control plane is the registry.
-
-        A fork gives the child an empty map. Without adoption it would create a
-        second VM for the same (flow, user), so the state a flow sees would
-        depend on which worker took the request and each worker would hold its
-        own billed guest.
-        """
+    def test_a_fork_child_does_not_adopt_the_parents_guest(self, monkeypatch, createos):
+        """A child cannot share a guest guarded by locks that exist only in the parent."""
         api = createos(_FakeCreateosApi(create_ids=["sb-one", "sb-two"]))
         _use_createos(monkeypatch, sandbox_session_mode="flow")
         executor = registry_module._instances["createos"]
@@ -925,7 +939,7 @@ class TestCreateosSessions:
         executor.reset_after_fork()
         run_code_in_sandbox("print(1)", session=_session())
 
-        assert api.created_ids == ["sb-one"]
+        assert api.created_ids == ["sb-one", "sb-two"]
         assert api.deleted_ids == []
 
 
@@ -1039,6 +1053,11 @@ class TestCreateosCapabilities:
         capabilities = createos_module._CreateosExecutor.capabilities()
         assert "169.254.0.0/16" in capabilities.egress_exceptions
 
+    def test_the_unrestricted_dns_path_is_declared(self):
+        """A domain allowlist still permits arbitrary DNS query names through the resolver."""
+        capabilities = createos_module._CreateosExecutor.capabilities()
+        assert any("DNS" in exception for exception in capabilities.egress_exceptions)
+
     def test_sessions_and_artifacts_are_offered(self):
         """Verify that the reported capabilities include session and artifact support."""
         capabilities = createos_module._CreateosExecutor.capabilities()
@@ -1066,6 +1085,7 @@ class TestCreateosTimeoutTaintsTheSession:
         _use_createos(monkeypatch, sandbox_session_mode="flow", sandbox_timeout_seconds=1)
         monkeypatch.setattr(createos_module, "_exec_deadline", lambda _timeout: -1.0)
         run_code_in_sandbox("while True: pass", session=_session())
+        first_name = api.bodies["create"]["name"]
 
         # Second execution completes normally, so it must not land on the
         # tainted guest.
@@ -1075,6 +1095,7 @@ class TestCreateosTimeoutTaintsTheSession:
 
         assert result.success
         assert api.created_ids == ["sb-one", "sb-two"]
+        assert api.bodies["create"]["name"] != first_name
 
     def test_a_tainted_guest_is_dropped_even_when_the_destroy_fails(self, monkeypatch, createos):
         """Otherwise a lost DELETE would leave the mapping pointing at a running guest."""
@@ -1151,8 +1172,8 @@ class TestCreateosArtifactDownloadIsBounded:
         assert len(result.files) == 10
 
 
-class TestCreateosSessionsAreOwnedByTheControlPlane:
-    """One guest per (flow, user), even across workers that share no memory."""
+class TestCreateosSessionsStayInsideOneWorker:
+    """Process-local locks and lifecycle code must never control a shared guest."""
 
     @staticmethod
     def _second_worker(monkeypatch, api):
@@ -1169,28 +1190,30 @@ class TestCreateosSessionsAreOwnedByTheControlPlane:
         )
         return executor
 
-    def test_a_second_worker_adopts_rather_than_duplicates(self, monkeypatch, createos):
-        """Verify that a second worker adopts the existing session guest instead of creating another."""
+    def test_a_second_worker_gets_a_distinct_guest(self, monkeypatch, createos):
+        """A second worker cannot safely adopt a guest guarded by another process's locks."""
         api = createos(_FakeCreateosApi(create_ids=["sb-one", "sb-two"]))
         _use_createos(monkeypatch, sandbox_session_mode="flow")
         run_code_in_sandbox("print(1)", session=_session())
+        first_name = api.bodies["create"]["name"]
 
         other = self._second_worker(monkeypatch, api)
         monkeypatch.setitem(registry_module._instances, "createos", other)
         run_code_in_sandbox("print(1)", session=_session())
 
-        assert api.created_ids == ["sb-one"]
+        assert api.created_ids == ["sb-one", "sb-two"]
+        assert api.bodies["create"]["name"] != first_name
 
-    def test_the_guest_is_named_from_the_session_token(self, monkeypatch, createos):
-        """Verify that the created guest's name is derived from the session token."""
+    def test_the_guest_gets_an_opaque_bounded_name(self, monkeypatch, createos):
+        """The control-plane name must fit its limit without leaking session identity."""
         api = createos(_FakeCreateosApi())
         _use_createos(monkeypatch, sandbox_session_mode="flow")
 
         run_code_in_sandbox("print(1)", session=_session())
 
         name = api.bodies["create"]["name"]
-        assert name == _session_name_for()
         assert name.startswith(createos_module._CREATEOS_SESSION_NAME_PREFIX)
+        assert len(name) == createos_module._CREATEOS_SESSION_NAME_MAX
 
     def test_the_name_leaks_neither_flow_nor_user(self, monkeypatch, createos):
         """Verify that the guest name contains neither the flow id nor the user id."""
@@ -1216,44 +1239,19 @@ class TestCreateosSessionsAreOwnedByTheControlPlane:
         assert first != second
         assert api.created_ids == ["sb-one", "sb-two"]
 
-    def test_a_lost_create_race_adopts_the_winner(self, monkeypatch, createos):
-        """Two workers can both find nothing, then both create; only one wins."""
-        api = createos(_FakeCreateosApi(create_ids=["sb-winner", "sb-loser"]))
-        _use_createos(monkeypatch, sandbox_session_mode="flow")
-        loser = self._second_worker(monkeypatch, api)
-        monkeypatch.setitem(registry_module._instances, "createos", loser)
-
-        # Hide the winner from the lookup so the loser goes straight to create
-        # and takes the 409 path, which is the race this guards.
-        real_find = loser._find_session_vm
-        calls = {"n": 0}
-
-        def find_once(client, name):
-            """Return None on the first lookup, then delegate to the real lookup."""
-            calls["n"] += 1
-            return None if calls["n"] == 1 else real_find(client, name)
-
-        monkeypatch.setattr(loser, "_find_session_vm", find_once)
-        api.names[_session_name_for()] = "sb-winner"
-
-        run_code_in_sandbox("print(1)", session=_session())
-
-        assert api.conflicts == 1
-        assert loser._sessions[_session_identity_for()][0] == "sb-winner"
-        assert "sb-loser" not in api.created_ids
-
-    def test_an_unresolvable_conflict_fails_closed(self, monkeypatch, createos):
-        """Never build a second guest for a session just because lookup failed."""
+    def test_a_random_name_collision_is_never_adopted(self, monkeypatch, createos):
+        """A conflicting guest may belong to another lock owner and must remain untouched."""
         api = createos(_FakeCreateosApi(create_ids=["sb-one"]))
         _use_createos(monkeypatch, sandbox_session_mode="flow")
-        executor = registry_module._instances["createos"]
-        api.names[_session_name_for()] = "sb-ghost"
-        monkeypatch.setattr(executor, "_find_session_vm", lambda _client, _name: None)
+        name = "lf-" + "f" * createos_module._CREATEOS_SESSION_TOKEN_CHARS
+        api.names[name] = "sb-ghost"
+        monkeypatch.setattr(createos_module, "_session_guest_name", lambda _identity: name)
 
-        with pytest.raises(SandboxExecutionError, match="cannot be found"):
+        with pytest.raises(SandboxExecutionError, match="refusing to adopt"):
             run_code_in_sandbox("print(1)", session=_session())
 
         assert api.created_ids == []
+        assert "sb-ghost" not in api.deleted_ids
 
     def test_a_throwaway_guest_is_not_named(self, monkeypatch, createos):
         """Only session guests are registered; a throwaway must not take a name."""
@@ -1266,7 +1264,7 @@ class TestCreateosSessionsAreOwnedByTheControlPlane:
 
 
 class TestCreateosProgramFileIsPerExecution:
-    """A shared session guest can hold two executions at once."""
+    """A long-lived guest must not accumulate or overwrite program files."""
 
     def test_two_executions_use_different_program_files(self, monkeypatch, createos):
         """Verify that two executions on the same session guest use different program file paths."""
@@ -1462,6 +1460,18 @@ class TestCreateosSessionGuestIsBoundToItsPolicy:
 
         assert api.created_ids == ["sb-small", "sb-big"]
 
+    def test_changing_rootfs_does_not_reuse_the_old_image(self, monkeypatch, createos):
+        """The same flow and policy must not inherit state from a different guest image."""
+        api = createos(_FakeCreateosApi(create_ids=["sb-old", "sb-new"]))
+        _use_createos(monkeypatch, sandbox_session_mode="flow")
+        monkeypatch.setenv("CREATEOS_SANDBOX_ROOTFS", "devbox:1")
+        run_code_in_sandbox("print(1)", session=_session())
+
+        monkeypatch.setenv("CREATEOS_SANDBOX_ROOTFS", "devbox:2")
+        run_code_in_sandbox("print(1)", session=_session())
+
+        assert api.created_ids == ["sb-old", "sb-new"]
+
     def test_an_unchanged_policy_still_reuses_the_guest(self, monkeypatch, createos):
         """The binding must not defeat reuse, which is the whole point of sessions."""
         api = createos(_FakeCreateosApi(create_ids=["sb-one", "sb-two"]))
@@ -1495,7 +1505,13 @@ class TestCreateosSessionGuestIsBoundToItsPolicy:
 
     def test_the_policy_bound_name_still_fits_the_control_plane_limit(self):
         """Verify that a policy-bound guest name still fits the control plane's name length limit."""
-        identity = createos_module._session_identity(SessionKey(flow_id="a", user_id="b").token(), ("0.0.0.0/32",), 192)
+        identity = createos_module._session_identity(
+            SessionKey(flow_id="a", user_id="b").token(),
+            ("0.0.0.0/32",),
+            192,
+            createos_module._CREATEOS_DEFAULT_ROOTFS,
+            "worker",
+        )
         name = createos_module._session_guest_name(identity)
         assert len(name) == createos_module._CREATEOS_SESSION_NAME_MAX
 

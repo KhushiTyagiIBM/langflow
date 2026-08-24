@@ -54,10 +54,8 @@ SANDBOX_BACKEND_CREATEOS = "createos"
 
 _CREATEOS_DEFAULT_BASE_URL = "https://api.sb.createos.sh"
 _CREATEOS_DEFAULT_ROOTFS = "devbox:1"
-# Each execution uploads its program under its own name. A fixed path was
-# enough while one guest served one execution, but a session guest is now
-# shared across workers (see _acquire_session_vm), so two executions can be in
-# flight on one guest and a fixed path would let each overwrite the other's
+# Each execution uploads its program under its own name. Unique paths keep a
+# retry or delayed control-plane command from overwriting another execution's
 # program. The suffix is hex from uuid4, so nothing a caller supplies reaches
 # the shell line built from it.
 _CREATEOS_GUEST_CODE_DIR = "/workspace"
@@ -84,10 +82,13 @@ _CREATEOS_ARTIFACT_TAR_COMMAND = (
     f"tar -czf {_CREATEOS_GUEST_ARTIFACT_ARCHIVE} -C {_CREATEOS_GUEST_ARTIFACT_DIR} . 2>/dev/null || true"
 )
 
-# A session guest is named after its session token so the control plane can act
-# as the registry: a sandbox name is unique per user among non-terminal
-# sandboxes, so create-with-name is a compare-and-swap between workers. The
-# token is already a truncated hash, so the name reveals no flow or user id.
+# A session guest is named after its session token, policy, image, worker, and
+# a random creation nonce.
+# CreateOS exposes no distributed lock or lease primitive, while execution,
+# reaping, and shutdown are guarded only by process-local locks. A worker id in
+# the opaque digest therefore prevents two processes from adopting and acting
+# on the same guest. Sticky routing is still required if callers expect session
+# state to survive load balancing across workers.
 #
 # The control plane caps a name at 22 characters and rejects a longer one with
 # 400 -- found by running this against the live API, not by any local test. The
@@ -96,13 +97,6 @@ _CREATEOS_ARTIFACT_TAR_COMMAND = (
 _CREATEOS_SESSION_NAME_MAX = 22
 _CREATEOS_SESSION_NAME_PREFIX = "lf-"
 _CREATEOS_SESSION_TOKEN_CHARS = _CREATEOS_SESSION_NAME_MAX - len(_CREATEOS_SESSION_NAME_PREFIX)
-
-# Bounds on the name lookup. The list endpoint has no name filter, so adoption
-# pages and matches client-side; a missed match only costs a 409 and a retry,
-# while an unbounded loop over a control-plane list does not.
-_CREATEOS_SESSION_LOOKUP_PAGE_SIZE = 500
-_CREATEOS_SESSION_LOOKUP_PAGES = 4
-
 
 # Upper bound on entries read from a guest-produced archive. The byte budget
 # does not bound this on its own: empty members cost nothing against it while
@@ -153,7 +147,7 @@ _CREATEOS_CONNECT_TIMEOUT_SECONDS = 10
 # Upper bound on what is added to the guest wall clock before the HTTP read is
 # abandoned, covering request transport and result marshalling. The VM teardown
 # is what actually stops a runaway execution, so this only decides when we stop
-# waiting. Capped against the configured timeout in _exec_deadline so a short
+# waiting. Capped against the configured timeout in _exec_transport_timeout so a short
 # sandbox_timeout_seconds is not silently multiplied.
 _CREATEOS_EXEC_GRACE_SECONDS = 15
 _CREATEOS_MIN_EXEC_GRACE_SECONDS = 2
@@ -178,16 +172,20 @@ def _auto_pause_seconds(timeout_seconds: int) -> int:
     return max(_CREATEOS_AUTO_PAUSE_MIN_SECONDS, timeout_seconds + _CREATEOS_AUTO_PAUSE_MARGIN_SECONDS)
 
 
-def _exec_deadline(timeout_seconds: int) -> float:
-    """HTTP read deadline for one exec call.
+def _exec_transport_timeout(timeout_seconds: int) -> float:
+    """HTTP read budget for one exec call.
 
-    ``sandbox_timeout_seconds`` is documented as the wall-clock limit, and the
-    exec endpoint has no server-side timeout, so this deadline IS the
-    enforcement. The margin therefore only has to cover transport, and it
-    scales with the configured value: 1s yields 3s rather than 16s, while the
-    30s default still gets the full 15s of slack.
+    The guest deadline is enforced separately at exactly
+    ``sandbox_timeout_seconds``. This larger budget prevents the transport
+    timeout from firing first and scales its grace: 1s yields 3s rather than
+    16s, while the 30s default gets the full 15s of slack.
     """
     return timeout_seconds + min(_CREATEOS_EXEC_GRACE_SECONDS, max(_CREATEOS_MIN_EXEC_GRACE_SECONDS, timeout_seconds))
+
+
+def _exec_deadline(timeout_seconds: int) -> float:
+    """The configured guest wall-clock limit, without transport grace."""
+    return float(timeout_seconds)
 
 
 # Hostname / wildcard-subdomain form from the documented egress grammar.
@@ -197,7 +195,7 @@ _MAX_PORT = 65535
 
 
 class _SessionNameTakenError(Exception):
-    """Another worker already registered this session's guest with the control plane."""
+    """A concurrent create already registered this worker's session guest."""
 
 
 def _guest_code_path() -> str:
@@ -205,36 +203,23 @@ def _guest_code_path() -> str:
     return f"{_CREATEOS_GUEST_CODE_DIR}/{_CREATEOS_GUEST_CODE_PREFIX}{uuid.uuid4().hex}.py"
 
 
-def _session_identity(token: str, egress: tuple[str, ...], memory_mb: int) -> str:
-    """Bind a session to the policy its guest must have been created under.
+def _rootfs() -> str:
+    """Return the configured guest image identity."""
+    return os.environ.get("CREATEOS_SANDBOX_ROOTFS", _CREATEOS_DEFAULT_ROOTFS).strip()
 
-    The create-time check (:meth:`_CreateosExecutor._assert_policy_applied`) is
-    the only place a guest's policy is ever verified, and a REUSED guest never
-    reaches it. A session guest deliberately outlives the process -- it carries
-    a stable name so another worker, or the same worker after a restart, adopts
-    it instead of building a second VM. That is what makes stale policy
-    reachable: tighten ``LANGFLOW_SANDBOX_ALLOW_NETWORK`` (or narrow the
-    allowlist, or raise the memory floor) and restart inside the auto-pause
-    window, and the old guest -- created under the OLD, looser policy -- is
-    still sitting there under the name the new process looks up.
 
-    Re-verifying on adoption is not an option: ``GET /v1/sandboxes/{id}`` omits
-    ``egress`` entirely, and ``GET /v1/sandboxes/{id}/egress`` answers with an
-    empty list even for a sandbox created with rules (checked against the live
-    control plane, both while starting and while running). There is no way to
-    ask what policy a guest actually has.
+def _session_identity(token: str, egress: tuple[str, ...], memory_mb: int, rootfs: str, worker_id: str) -> str:
+    """Bind a session to its policy, image, and process-local owner.
 
-    So the policy is folded into the identity instead. A guest is only ever
-    adopted by a process asking for the same policy that guest was created
-    with, because any other policy simply derives a different name and misses
-    it. Changing a setting orphans the old guest rather than inheriting it; the
-    idle reaper and the control plane's auto-pause collect it. Session state
-    does not survive that, which is correct -- the state belongs to a guest the
-    operator has just declared unacceptable.
+    Reused guests do not repeat create-time policy verification, and CreateOS
+    does not expose enough policy metadata to verify one on adoption. Folding
+    every create-time input into the opaque name prevents reuse after an
+    egress, memory, or rootfs change. Including the worker id keeps the guest
+    inside the process-local lock/reaper/shutdown ownership boundary.
     """
     # Sorted so an allowlist written in a different order is the same policy,
     # and unit-separated so ("a", "b") cannot collide with ("a\x1fb",).
-    policy = "\x1f".join((*sorted(egress), str(memory_mb)))
+    policy = "\x1f".join((*sorted(egress), str(memory_mb), rootfs, worker_id))
     return hashlib.sha256(f"{token}\x00{policy}".encode()).hexdigest()
 
 
@@ -324,7 +309,7 @@ class _CreateosExecutor:
         all as allow-all, so "no network" is expressed as a reserved CIDR that
         parses cleanly and matches nothing (see ``_CREATEOS_DENY_ALL_EGRESS``).
 
-        ``egress_exceptions`` names the traffic that policy cannot reach:
+        ``egress_exceptions`` names traffic outside the requested policy:
         ``fc/internal/hosts/vm/egress.go`` unconditionally ACCEPTs the guest's
         own /31, all of 169.254.0.0/16, and the agent time servers before the
         final DROP, so link-local is always reachable whatever the policy says.
@@ -335,7 +320,9 @@ class _CreateosExecutor:
         credentials to it in plaintext -- Langflow attaches no disks today, so
         nothing Langflow places in a sandbox is exposed through this path, but
         a future integration that does attach one would need to know this
-        first. Declared here rather than left for an operator to discover.
+        first. A restricted domain policy also opens a public resolver that
+        accepts arbitrary query names, so that DNS exfiltration path is
+        declared too rather than hidden in the policy translation.
         """
         return Capabilities(
             isolation="hardware-virtualized",
@@ -343,7 +330,7 @@ class _CreateosExecutor:
             supports_domain_allowlist=True,
             supports_sessions=True,
             supports_artifacts=True,
-            egress_exceptions=("169.254.0.0/16",),
+            egress_exceptions=("169.254.0.0/16", "1.1.1.1:53 (unrestricted DNS queries)"),
         )
 
     def shutdown(self) -> None:
@@ -359,6 +346,7 @@ class _CreateosExecutor:
         self._lock = threading.Lock()
         self._shapes: tuple[tuple[int, str], ...] | None = None
         self._preflighted = False
+        self._worker_id = uuid.uuid4().hex
         # session token -> (sandbox id, monotonic time of last use)
         self._sessions: dict[str, tuple[str, float]] = {}
         # One lock per session so two executions of the same session cannot
@@ -651,7 +639,9 @@ class _CreateosExecutor:
         # settings the operator has since changed is never adopted. See
         # _session_identity -- the control plane cannot be asked what policy a
         # running guest has, so the name is what has to encode it.
-        token = _session_identity(session.token(), self._egress_for(settings), settings.memory_mb)
+        token = _session_identity(
+            session.token(), self._egress_for(settings), settings.memory_mb, _rootfs(), self._worker_id
+        )
         lock = self._session_lock(token)
         with lock, self._client(_CREATEOS_CONTROL_TIMEOUT_SECONDS) as client:
             self._reap_idle_sessions(client, settings, token)
@@ -716,18 +706,10 @@ class _CreateosExecutor:
         destroyed by an operator, or lost with its host. A stale id would
         otherwise surface as a 404 that looks like a broken execution.
 
-        The in-process map is a CACHE, not the registry. Langflow runs more
-        than one worker, and ``os.fork`` gives each child an empty map, so a
-        map-only design hands every worker its own guest for the same session:
-        the state a flow sees would depend on which worker took the request,
-        and each worker would hold a billed VM for the same identity.
-
-        The control plane is the registry instead. A sandbox ``name`` is unique
-        per user among non-terminal sandboxes, so creating with a name derived
-        from the session token is a compare-and-swap: the first worker wins and
-        every other gets 409, then adopts the winner's guest. Verified against
-        the live API -- a duplicate name returns 409 and the guest is findable
-        by name.
+        The in-process map is authoritative. The guest name includes this
+        worker's random identity and a fresh creation nonce, so neither another
+        process nor a caller racing with teardown can adopt a guest protected
+        by a different lock object.
         """
         with self._lock:
             cached = self._sessions.get(token)
@@ -745,14 +727,6 @@ class _CreateosExecutor:
             logger.debug("CreateOS session guest %s is no longer running; replacing it", sandbox_id)
             self._drop_session(client, token)
 
-        name = _session_guest_name(token)
-        # Another worker may already own this session's guest.
-        adopted = self._find_session_vm(client, name)
-        if adopted is not None:
-            with self._lock:
-                self._sessions[token] = (adopted, time.monotonic())
-            return adopted
-
         # The control plane's own backstop must outlive our reaper, or it would
         # pause a session that is merely between executions and the state the
         # operator opted into would vanish without anyone saying so.
@@ -760,55 +734,16 @@ class _CreateosExecutor:
             _auto_pause_seconds(settings.timeout_seconds),
             settings.session_idle_seconds + _CREATEOS_AUTO_PAUSE_MARGIN_SECONDS,
         )
+        creation_identity = hashlib.sha256(f"{token}\x00{uuid.uuid4().hex}".encode()).hexdigest()
+        name = _session_guest_name(creation_identity)
         try:
             sandbox_id = self._create(client, env, settings, auto_pause=auto_pause, name=name)
-        except _SessionNameTakenError:
-            # Another worker won the race between the lookup above and this
-            # create. Its guest is the session's guest.
-            sandbox_id = self._find_session_vm(client, name)
-            if sandbox_id is None:
-                msg = (
-                    "CreateOS reports a sandbox already exists for this session but it cannot be "
-                    "found. Refusing to run the code rather than build a second guest for the "
-                    "same session."
-                )
-                raise SandboxExecutionError(msg) from None
+        except _SessionNameTakenError as exc:
+            msg = "CreateOS reports a collision for a randomly named session guest; refusing to adopt it"
+            raise SandboxExecutionError(msg) from exc
         with self._lock:
             self._sessions[token] = (sandbox_id, time.monotonic())
         return sandbox_id
-
-    def _find_session_vm(self, client: httpx.Client, name: str) -> str | None:
-        """Find a running guest already registered under ``name``.
-
-        The list endpoint has no name filter, so this pages and matches
-        client-side. Paging is bounded: a caller with more running sandboxes
-        than that has problems this function cannot solve, and an unbounded
-        loop on a control-plane list is worse than a missed adoption, which
-        only costs a 409 and a retry.
-
-        Returns None on any failure. A failed lookup must not block a run; the
-        create that follows either succeeds or reports the conflict itself.
-        """
-        offset = 0
-        for _ in range(_CREATEOS_SESSION_LOOKUP_PAGES):
-            try:
-                data = self._unwrap(
-                    client.get(
-                        "/v1/sandboxes",
-                        params={"status": "running", "limit": _CREATEOS_SESSION_LOOKUP_PAGE_SIZE, "offset": offset},
-                    )
-                )
-            except (httpx.HTTPError, SandboxExecutionError):
-                logger.debug("Could not list CreateOS sandboxes while looking up a session guest", exc_info=True)
-                return None
-            rows = data.get("data") or []
-            for row in rows:
-                if row.get("name") == name and row.get("id"):
-                    return str(row["id"])
-            if len(rows) < _CREATEOS_SESSION_LOOKUP_PAGE_SIZE:
-                return None
-            offset += _CREATEOS_SESSION_LOOKUP_PAGE_SIZE
-        return None
 
     def _is_running(self, client: httpx.Client, sandbox_id: str) -> bool:
         """Return True when the CreateOS sandbox reports status "running"."""
@@ -828,9 +763,9 @@ class _CreateosExecutor:
             # bounded by the idle reaper, this map would not be.
             #
             # Safe to delete while the caller still holds the lock object: a
-            # concurrent _session_lock() call simply creates a fresh one, and
-            # the two can only be handed out once no _sessions entry remains,
-            # which is exactly when there is no guest left to serialize on.
+            # concurrent caller gets a fresh lock AND a fresh random guest
+            # name. It cannot adopt the guest whose asynchronous destroy was
+            # just requested, so the two lock objects never guard one VM.
             self._session_locks.pop(token, None)
         if entry is not None:
             self._destroy(client, entry[0])
@@ -917,14 +852,14 @@ class _CreateosExecutor:
 
         Raises:
             _SessionNameTakenError: ``name`` was given and is already in use, which
-                means another worker owns this session's guest.
+                means a concurrent create already owns this session's guest.
         """
         shape = self._shape_for(settings.memory_mb)
         egress = self._egress_for(settings)
         # Keys must be declared at create time; a key introduced on the exec
         # call alone is rejected by the control plane.
         envs = {key: str(value) for key, value in (env or {}).items()}
-        rootfs = os.environ.get("CREATEOS_SANDBOX_ROOTFS", _CREATEOS_DEFAULT_ROOTFS).strip()
+        rootfs = _rootfs()
         body = {
             "shape": shape,
             "rootfs": rootfs,
@@ -1081,6 +1016,11 @@ class _CreateosExecutor:
             raise SandboxExecutionError(msg) from exc
 
         result = self._stream_exec(client, sandbox_id, code_path, settings)
+        if result.exit_code == _EXIT_CODE_TIMEOUT:
+            # The stream close starts the kill path. Do not issue artifact or
+            # metrics commands while the timed-out program may still be dying;
+            # return immediately so the caller can destroy the guest.
+            return result
         if settings.collect_artifacts:
             result = self._with_artifacts(client, sandbox_id, result, settings)
         self._log_metrics(client, sandbox_id)
@@ -1103,16 +1043,26 @@ class _CreateosExecutor:
         destroying the VM, which is not available when the guest has to live on,
         and which discards whatever the program had already printed.
         """
-        # Computed once and used for both the loop deadline and the transport
-        # budget, so the two can never disagree. Clamped at zero because the
-        # transport rejects a negative timeout, while the loop reads any past
-        # deadline as "already expired".
-        budget = _exec_deadline(settings.timeout_seconds)
-        deadline = time.monotonic() + budget
+        transport_budget = _exec_transport_timeout(settings.timeout_seconds)
+        deadline = time.monotonic() + _exec_deadline(settings.timeout_seconds)
         stdout: list[str] = []
         stderr: list[str] = []
+        output_bytes = 0
         exit_code: int | None = None
         started = time.monotonic()
+
+        def append_output(target: list[str], value: object) -> None:
+            """Append one stream field while enforcing the combined host-memory budget."""
+            nonlocal output_bytes
+            text = str(value)
+            output_bytes += len(text.encode("utf-8"))
+            if output_bytes > settings.max_output_bytes:
+                msg = (
+                    "CreateOS sandbox output exceeded LANGFLOW_SANDBOX_MAX_OUTPUT_BYTES "
+                    f"({settings.max_output_bytes} bytes)"
+                )
+                raise SandboxExecutionError(msg)
+            target.append(text)
 
         try:
             with client.stream(
@@ -1120,7 +1070,7 @@ class _CreateosExecutor:
                 f"/v1/sandboxes/{sandbox_id}/exec",
                 params={"stream": "true"},
                 json={"cmd": _CREATEOS_GUEST_SHELL, "args": ["-c", self._guest_command(code_path, settings)]},
-                timeout=self._timeout(max(budget, 0.0)),
+                timeout=self._timeout(transport_budget),
             ) as response:
                 if response.status_code != httpx.codes.OK:
                     response.read()
@@ -1137,9 +1087,9 @@ class _CreateosExecutor:
                     if event.get("hb"):
                         continue
                     if event.get("stdout"):
-                        stdout.append(str(event["stdout"]))
+                        append_output(stdout, event["stdout"])
                     if event.get("stderr"):
-                        stderr.append(str(event["stderr"]))
+                        append_output(stderr, event["stderr"])
                     if event.get("error"):
                         msg = f"CreateOS could not start the guest command: {self._redact(str(event['error']))}"
                         raise SandboxExecutionError(msg)
@@ -1384,6 +1334,7 @@ class _CreateosExecutor:
         self._lock = threading.Lock()
         self._session_locks = {}
         self._sessions = {}
+        self._worker_id = uuid.uuid4().hex
 
 
 # Re-executing this module (importlib.reload, or a test that reimports it)

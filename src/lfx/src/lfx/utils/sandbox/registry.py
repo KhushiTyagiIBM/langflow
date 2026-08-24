@@ -234,6 +234,8 @@ def _load_entry_points_locked() -> None:
         logger.warning("Could not enumerate %s entry points", _ENTRY_POINT_GROUP, exc_info=True)
         return
 
+    candidates = {}
+    duplicate_names: set[str] = set()
     for entry_point in discovered:
         plugin_name = entry_point.name.strip().lower()
         if plugin_name not in allowed:
@@ -246,6 +248,19 @@ def _load_entry_points_locked() -> None:
                 "Refusing sandbox backend plugin %r: that name belongs to a built-in backend", entry_point.name
             )
             continue
+        if plugin_name in candidates:
+            duplicate_names.add(plugin_name)
+            continue
+        candidates[plugin_name] = entry_point
+
+    for plugin_name in duplicate_names:
+        candidates.pop(plugin_name, None)
+        logger.warning(
+            "Refusing sandbox backend plugin %r: multiple distributions declare that allowlisted name",
+            plugin_name,
+        )
+
+    for entry_point in candidates.values():
         try:
             factory = entry_point.load()
         except Exception:  # noqa: BLE001 - one bad plugin must not hide the others

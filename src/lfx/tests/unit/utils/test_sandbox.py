@@ -15,6 +15,7 @@ import time
 from types import SimpleNamespace
 
 import pytest
+from lfx.observability import execution_protocol
 from lfx.utils import sandbox as sandbox_module
 from lfx.utils.sandbox import (
     SandboxExecutionError,
@@ -24,6 +25,7 @@ from lfx.utils.sandbox import (
     is_sandbox_enabled,
     run_code_in_sandbox,
     sanitize_code,
+    session_for_component,
 )
 from lfx.utils.sandbox import base as base_module
 from lfx.utils.sandbox import exec_sandbox as exec_module
@@ -1037,9 +1039,12 @@ class TestSettingsValidation:
                 SecuritySettings(sandbox_session_idle_seconds=value)
             with pytest.raises(ValidationError):
                 SecuritySettings(sandbox_max_artifact_bytes=value)
+            with pytest.raises(ValidationError):
+                SecuritySettings(sandbox_max_output_bytes=value)
 
         assert SecuritySettings(sandbox_session_idle_seconds=600).sandbox_session_idle_seconds == 600
         assert SecuritySettings(sandbox_max_artifact_bytes=1024).sandbox_max_artifact_bytes == 1024
+        assert SecuritySettings(sandbox_max_output_bytes=1024).sandbox_max_output_bytes == 1024
 
     def test_allowed_domains_normalized(self):
         """Verify that allowed domains are trimmed and blanks are dropped."""
@@ -1367,6 +1372,35 @@ class TestSessionKey:
         two = base_module.SessionKey(flow_id="ab", user_id="c").token()
         assert one != two
 
+    def test_served_session_uses_the_end_user_not_the_service_account(self):
+        """A shared service account must not collapse different callers into one guest."""
+        component = SimpleNamespace(
+            flow_id="flow", user_id="service-account", graph=SimpleNamespace(end_user_id="end-user")
+        )
+
+        with execution_protocol("v2"):
+            session = session_for_component(component)
+
+        assert session == base_module.SessionKey(flow_id="flow", user_id="end-user")
+
+    def test_anonymous_served_session_runs_cold(self):
+        """An unidentified served caller cannot safely reuse any guest."""
+        component = SimpleNamespace(flow_id="flow", user_id="service-account", graph=SimpleNamespace(end_user_id=None))
+
+        with execution_protocol("webhook"):
+            session = session_for_component(component)
+
+        assert session is None
+
+    def test_editor_session_keeps_the_owner_identity(self):
+        """Authenticated editor runs still reuse their owner's guest."""
+        component = SimpleNamespace(flow_id="flow", user_id="owner", graph=SimpleNamespace(end_user_id=None))
+
+        with execution_protocol("v1.build"):
+            session = session_for_component(component)
+
+        assert session == base_module.SessionKey(flow_id="flow", user_id="owner")
+
 
 class TestSessionStateCarryOver:
     """Reusing a guest keeps its filesystem, not its Python process."""
@@ -1655,6 +1689,17 @@ class TestSandboxBackendPlugins:
 
         assert point.loaded
         assert "vendor" in names
+
+    def test_duplicate_allowlisted_plugin_names_load_neither(self, monkeypatch, entry_points):
+        """An allowlist name is not enough to choose between two distributions."""
+        monkeypatch.setenv("LANGFLOW_SANDBOX_BACKEND_PLUGINS", "vendor")
+        first, second = entry_points(_FakeEntryPoint("vendor"), _FakeEntryPoint("VENDOR"))
+
+        names = registry_module.known_sandbox_backends()
+
+        assert not first.loaded
+        assert not second.loaded
+        assert "vendor" not in names
 
     def test_an_unlisted_plugin_is_skipped_while_a_listed_one_loads(self, monkeypatch, entry_points):
         """Verify that only the allowlisted plugin loads when several entry points are present."""

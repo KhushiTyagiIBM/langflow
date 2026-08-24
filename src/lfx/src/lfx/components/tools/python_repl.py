@@ -11,7 +11,7 @@ from lfx.inputs.inputs import StrInput
 from lfx.log.logger import logger
 from lfx.schema.data import Data
 from lfx.utils.python_repl_security import ensure_code_execution_enabled, safe_builtins, validate_code_safety
-from lfx.utils.sandbox import is_sandbox_enabled, run_code_in_sandbox, sanitize_code, session_for
+from lfx.utils.sandbox import is_sandbox_enabled, run_code_in_sandbox, sanitize_code, session_for_component
 
 
 class PythonREPLToolComponent(LCToolComponent):
@@ -165,7 +165,7 @@ class PythonREPLToolComponent(LCToolComponent):
                     result = run_code_in_sandbox(
                         sanitize_code(code),
                         global_imports=self.global_imports,
-                        session=session_for(self.flow_id, self.user_id),
+                        session=session_for_component(self),
                     )
                     if not result.success:
                         # Parity with the in-process path: PythonREPL.run()

@@ -272,6 +272,7 @@ EXPECTED_FIELDS = {
     "sandbox_session_idle_seconds",
     "sandbox_collect_artifacts",
     "sandbox_max_artifact_bytes",
+    "sandbox_max_output_bytes",
     # SecuritySettings: rebuild drifted built-ins with this server's code (issue #14455)
     "substitute_outdated_component_code",
     # VariablesSettings: operator-tunable Langflow Assistant prompt length
