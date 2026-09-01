@@ -662,6 +662,17 @@ class DB2VS(VectorStore):
         filter: dict[str, Any] | None = None,  # noqa: A002
         **kwargs: Any,
     ) -> list[Document]:
+        """Return docs most similar to the given embedding vector.
+
+        Args:
+            embedding: Embedding vector to search with.
+            k: Number of documents to return.
+            filter: Optional metadata filter.
+            **kwargs: Additional keyword arguments.
+
+        Returns:
+            List of Documents most similar to the embedding.
+        """
         docs_and_scores = self.similarity_search_by_vector_with_relevance_scores(
             embedding=embedding, k=k, filter=filter, **kwargs
         )
@@ -700,6 +711,17 @@ class DB2VS(VectorStore):
         filter: dict[str, Any] | None = None,  # noqa: A002
         **kwargs: Any,  # noqa: ARG002
     ) -> list[tuple[Document, float]]:
+        """Return docs and relevance scores most similar to the given embedding.
+
+        Args:
+            embedding: Embedding vector to search with.
+            k: Number of documents to return.
+            filter: Optional metadata filter dict.
+            **kwargs: Additional keyword arguments (unused).
+
+        Returns:
+            List of (Document, distance_score) tuples ordered by ascending distance.
+        """
         docs_and_scores = []
         embedding_len = self.get_embedding_dimension()
 
@@ -782,6 +804,17 @@ class DB2VS(VectorStore):
         filter: dict[str, Any] | None = None,  # noqa: A002
         **kwargs: Any,  # noqa: ARG002
     ) -> list[tuple[Document, float, np.ndarray]]:
+        """Return docs, scores, and raw embedding vectors for MMR pre-fetch.
+
+        Args:
+            embedding: Embedding vector to search with.
+            k: Number of documents to return.
+            filter: Optional metadata filter.
+            **kwargs: Additional keyword arguments (unused).
+
+        Returns:
+            List of (Document, score, embedding_array) tuples.
+        """
         documents = []
         embedding_len = self.get_embedding_dimension()
 
